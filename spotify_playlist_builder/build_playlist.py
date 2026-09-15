@@ -36,6 +36,10 @@ DEFAULT_OUTPUT = HERE / "coletanea_musicas.xlsx"
 DEFAULT_CACHE_DIR = HERE / ".cache_artists"
 DEFAULT_PLAYLIST_NAME = "coletânea de músicas"
 SPOTIFY_PLAYLIST_TRACK_LIMIT = 10_000
+# Pausa entre chamadas à API para não estourar o rate limit do Spotify
+# (um bloqueio de rate limit pode durar horas, então vale ir com calma).
+REQUEST_DELAY = 0.3
+ARTIST_DELAY = 1.0
 
 # Marcadores de versões que NÃO devem entrar (ao vivo, cover, remix, etc.)
 EXCLUDE_PATTERNS = re.compile(
@@ -108,9 +112,11 @@ def get_spotify_client(need_user_auth: bool) -> spotipy.Spotify:
 
 def find_artist(sp: spotipy.Spotify, name: str):
     results = sp.search(q=f'artist:"{name}"', type="artist", limit=5)
+    time.sleep(REQUEST_DELAY)
     items = results.get("artists", {}).get("items", [])
     if not items:
         results = sp.search(q=name, type="artist", limit=5)
+        time.sleep(REQUEST_DELAY)
         items = results.get("artists", {}).get("items", [])
     if not items:
         return None
@@ -137,10 +143,10 @@ def get_artist_tracks(sp: spotipy.Spotify, artist_id: str, market: str):
             artist_id, album_type="album,single", country=market, limit=50, offset=offset
         )
         albums.extend(page["items"])
+        time.sleep(REQUEST_DELAY)
         if page["next"] is None:
             break
         offset += 50
-        time.sleep(0.05)
 
     # álbuns de estúdio primeiro, depois singles -> favorece manter a versão
     # de álbum quando a mesma música aparece também como single
@@ -176,10 +182,10 @@ def get_artist_tracks(sp: spotipy.Spotify, artist_id: str, market: str):
                         "uri": t["uri"],
                     }
                 )
+            time.sleep(REQUEST_DELAY)
             if page["next"] is None:
                 break
             offset += 50
-            time.sleep(0.05)
 
     tracks.sort(key=lambda t: t["release_date"] or "")
     return tracks
@@ -210,31 +216,41 @@ def step_spreadsheet(args):
     results = {}  # artist name -> list of track dicts
     matched_names = {}  # artist name -> nome exato encontrado no Spotify
 
-    for i, name in enumerate(artists, 1):
-        cache_file = args.cache_dir / f"{slugify(name)}.json"
-        if cache_file.exists():
-            data = json.loads(cache_file.read_text(encoding="utf-8"))
-            results[name] = data["tracks"]
-            matched_names[name] = data["matched_name"]
-            log.info("[%d/%d] %s -> cache (%d músicas)", i, len(artists), name, len(data["tracks"]))
-            continue
+    try:
+        for i, name in enumerate(artists, 1):
+            cache_file = args.cache_dir / f"{slugify(name)}.json"
+            if cache_file.exists():
+                data = json.loads(cache_file.read_text(encoding="utf-8"))
+                results[name] = data["tracks"]
+                matched_names[name] = data["matched_name"]
+                log.info("[%d/%d] %s -> cache (%d músicas)", i, len(artists), name, len(data["tracks"]))
+                continue
 
-        log.info("[%d/%d] Buscando: %s", i, len(artists), name)
-        artist = find_artist(sp, name)
-        if artist is None:
-            log.warning("  -> artista não encontrado no Spotify: %s", name)
-            not_found.append(name)
-            continue
+            log.info("[%d/%d] Buscando: %s", i, len(artists), name)
+            artist = find_artist(sp, name)
+            if artist is None:
+                log.warning("  -> artista não encontrado no Spotify: %s", name)
+                not_found.append(name)
+                continue
 
-        tracks = get_artist_tracks(sp, artist["id"], args.market)
-        results[name] = tracks
-        matched_names[name] = artist["name"]
-        log.info("  -> encontrado como '%s' | %d músicas oficiais únicas", artist["name"], len(tracks))
+            tracks = get_artist_tracks(sp, artist["id"], args.market)
+            results[name] = tracks
+            matched_names[name] = artist["name"]
+            log.info("  -> encontrado como '%s' | %d músicas oficiais únicas", artist["name"], len(tracks))
 
-        cache_file.write_text(
-            json.dumps({"matched_name": artist["name"], "tracks": tracks}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+            cache_file.write_text(
+                json.dumps({"matched_name": artist["name"], "tracks": tracks}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            time.sleep(ARTIST_DELAY)
+    except KeyboardInterrupt:
+        log.warning(
+            "Interrompido pelo usuário. Progresso salvo em %s — rode o mesmo comando de novo "
+            "para continuar de onde parou. Gerando planilha parcial com o que já foi coletado...",
+            args.cache_dir,
         )
+        build_spreadsheet(results, matched_names, Path(args.output))
+        sys.exit(1)
 
     build_spreadsheet(results, matched_names, Path(args.output))
 
